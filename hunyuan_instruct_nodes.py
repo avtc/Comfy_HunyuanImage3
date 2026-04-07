@@ -1622,21 +1622,46 @@ class HunyuanInstructLoader:
         start_time = time.time()
         
         if quant_type == "nf4":
-            # NF4 pre-quantized models: load to single GPU, no quantization_config needed
-            # These models are small enough (~24GB) to fit on one GPU
-            logger.info("Loading pre-quantized NF4 Instruct model to single GPU...")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                device_map={"": "cuda:0"},  # Single GPU, moveable
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                attn_implementation=attention_impl,
-                moe_impl=moe_impl,
-                moe_drop_tokens=True,
-                low_cpu_mem_usage=True,
-                # No quantization_config - model is pre-quantized on disk
-            )
-            model_info["is_moveable"] = True
+            # NF4 pre-quantized models: ~29GB. Strategy depends on blocks_to_swap.
+            logger.info("Loading pre-quantized NF4 Instruct model...")
+
+            if blocks_to_swap > 0 and BLOCK_SWAP_AVAILABLE:
+                # Block swap mode: load entirely to CPU, then manually place
+                # non-block components on GPU. BlockSwapManager handles the
+                # 32 transformer blocks.
+                # Params4bit.to(device) supports GPU↔CPU movement.
+                logger.info(f"  Block swap mode: loading NF4 model to CPU first...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    device_map="cpu",
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation=attention_impl,
+                    moe_impl=moe_impl,
+                    moe_drop_tokens=True,
+                    low_cpu_mem_usage=True,
+                    # No quantization_config - model is pre-quantized on disk
+                )
+                # Move non-block components to GPU (VAE, vision, embeddings, etc.)
+                logger.info("  Moving non-block components to GPU...")
+                _move_non_block_components_to_gpu(model, target_device="cuda:0", verbose=1)
+                model_info["is_moveable"] = True
+            else:
+                # No block swap: load NF4 model directly to single GPU.
+                # Requires ~48GB VRAM (29GB model + inference headroom).
+                logger.info("Loading pre-quantized NF4 Instruct model to single GPU...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    device_map={"": "cuda:0"},  # Single GPU, moveable
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation=attention_impl,
+                    moe_impl=moe_impl,
+                    moe_drop_tokens=True,
+                    low_cpu_mem_usage=True,
+                    # No quantization_config - model is pre-quantized on disk
+                )
+                model_info["is_moveable"] = True
             
         elif quant_type == "int8":
             # INT8 pre-quantized models: ~80GB. Strategy depends on blocks_to_swap.
