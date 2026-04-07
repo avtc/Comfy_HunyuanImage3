@@ -1031,9 +1031,11 @@ class BlockSwapManager:
         # ALWAYS check for and wait on prefetch events first
         # This must happen BEFORE checking location because prefetch updates location optimistically
         if block_idx in self._prefetch_events:
-            if self.config.debug:
-                logger.info(f"  Waiting for prefetch event...")
-            self._prefetch_events[block_idx].synchronize()
+            event = self._prefetch_events[block_idx]
+            if event is not None:
+                if self.config.debug:
+                    logger.info(f"  Waiting for prefetch event...")
+                event.synchronize()
             del self._prefetch_events[block_idx]
         else:
             # Block wasn't prefetched, need to do sync transfer
