@@ -2408,9 +2408,16 @@ class HunyuanInstructImageEdit:
                     "max": 2,
                     "tooltip": "Verbosity level. 0=silent (recommended), 1=info (shows full system prompt), 2=debug"
                 }),
+                "resolution": (RESOLUTION_LIST, {
+                    "default": "auto",
+                    "tooltip": (
+                        "Output image resolution. Auto lets the model decide based on the input image.\n"
+                        "Selecting a specific resolution overrides the input image size."
+                    )
+                }),
             }
         }
-    
+
     def edit(
         self,
         model,
@@ -2425,9 +2432,17 @@ class HunyuanInstructImageEdit:
         flow_shift: float = 2.8,
         max_new_tokens: int = 2048,
         verbose: int = 0,
+        resolution: str = "auto",
     ) -> Tuple[torch.Tensor, str, str]:
         """Edit image based on instruction."""
-        
+
+        # Parse resolution
+        res_mode, height, width = parse_resolution(resolution)
+        if res_mode == "auto":
+            image_size = "auto"
+        else:
+            image_size = f"{height}x{width}"
+
         # Convert input image to temp file
         temp_path = tensor_to_temp_path(image)
         temp_files = [temp_path]
@@ -2476,6 +2491,7 @@ class HunyuanInstructImageEdit:
             logger.info(f"Editing image:")
             logger.info(f"  Instruction: {instruction[:100]}...")
             logger.info(f"  Bot task: {bot_task}")
+            logger.info(f"  Resolution: {image_size}")
             logger.info(f"  Steps: {steps}, Seed: {seed}")
             
             start_time = time.time()
@@ -2498,7 +2514,7 @@ class HunyuanInstructImageEdit:
                 prompt=instruction,
                 image=temp_path,  # Single image path
                 seed=seed,
-                image_size="auto",
+                image_size=image_size,
                 use_system_prompt=use_system_prompt_value,
                 system_prompt=custom_system_prompt,
                 bot_task=bot_task,
