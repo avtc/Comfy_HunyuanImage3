@@ -942,8 +942,6 @@ def apply_nf4_transformers_compat(model) -> None:
     vit_process_image = getattr(image_processor, "vit_process_image", None)
     if image_processor is not None and callable(vit_process_image) and \
             not getattr(vit_process_image, "_hunyuan_t5_compat_patched", False):
-        import types
-
         original_vit = vit_process_image
 
         def _compat_vit_process_image(self, *args, **kwargs):
@@ -989,9 +987,21 @@ def apply_nf4_transformers_compat(model) -> None:
                 except Exception:
                     inner.__call__ = inner_call  # type: ignore[assignment]
 
-        bound = types.MethodType(_compat_vit_process_image, image_processor)
-        bound._hunyuan_t5_compat_patched = True  # type: ignore[attr-defined]
-        image_processor.vit_process_image = bound
+        # Wrap in a callable class so the guard's getattr() can find the flag
+        # (plain bound methods don't allow arbitrary attribute assignment).
+        class _PatchedVitProcess:  # noqa: WPS431
+            _hunyuan_t5_compat_patched = True
+
+            def __init__(self, fn, instance):
+                self._fn = fn
+                self._instance = instance
+
+            def __call__(self, *a, **kw):
+                return self._fn(self._instance, *a, **kw)
+
+        image_processor.vit_process_image = _PatchedVitProcess(
+            _compat_vit_process_image, image_processor
+        )
         logger.info(
             "Patched image_processor.vit_process_image for transformers >=5.0 "
             "(coerces pixel_values list -> tensor, issue #34)"
