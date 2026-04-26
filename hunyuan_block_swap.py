@@ -777,57 +777,20 @@ class BlockSwapManager:
     # ------------------------------------------------------------------
     
     def _move_nf4_block_params(self, block, device: torch.device) -> None:
-        """Move a block's params/buffers to *device* one at a time, handling NF4.
+        """Move a block's NF4 params/buffers GPU→CPU one at a time.
 
-        bitsandbytes ``Params4bit`` tensors carry a ``quant_state`` whose
-        sub-tensors live on the same device as the parameter.  Calling
-        ``module.to(device, non_blocking=True)`` raises ``cudaErrorInvalidValue``
-        on CUDA->CPU (non-blocking is unsupported for paged-host transfers of
-        the packed uint8 storage), so we move each tensor synchronously and
-        also walk the ``quant_state`` to keep its tensors coherent.
-
-        Pre-quantized NF4 models loaded by transformers >=5.0 may have
-        ``Params4bit.quant_state is None`` even though ``bnb_quantized=True``.
-        Before moving parameters, we ensure every ``Linear4bit`` in the block
-        has a properly initialized ``weight.quant_state``.
+        Used for GPU→CPU offload only (CPU→GPU uses ``block.to()`` which
+        properly handles ``Params4bit._quantize()``).  ``Params4bit.to()``
+        with ``non_blocking=True`` raises ``cudaErrorInvalidValue`` on
+        CUDA→CPU, so we move each tensor synchronously and walk the
+        ``quant_state`` to keep its sub-tensors coherent.
         """
         try:
-            from bitsandbytes.nn import Linear4bit, Params4bit  # noqa: F401
+            from bitsandbytes.nn import Params4bit  # noqa: F401
         except ImportError:
-            Linear4bit = None  # type: ignore[assignment]
             Params4bit = None  # type: ignore[assignment]
 
-        # Phase 1: ensure quant_state is initialized on every Linear4bit weight.
-        # This MUST happen before the parameter loop because Params4bit.to()
-        # skips _quantize() when bnb_quantized=True, leaving quant_state=None.
-        if Linear4bit is not None and device.type == "cuda":
-            for module in block.modules():
-                if not isinstance(module, Linear4bit):
-                    continue
-                weight = getattr(module, "weight", None)
-                if not isinstance(weight, Params4bit):
-                    continue
-                if getattr(weight, "quant_state", None) is not None:
-                    continue
-                # quant_state missing on weight — recover it.
-                module_qs = getattr(module, "quant_state", None)
-                if module_qs is not None:
-                    # Module has the quant_state backup — copy to weight.
-                    weight.quant_state = module_qs
-                else:
-                    # Neither weight nor module has quant_state.
-                    # module.cuda() triggers Params4bit._quantize() which
-                    # builds quant_state from the raw weight data.
-                    try:
-                        module.cuda(device)
-                    except Exception as exc:
-                        logger.debug(
-                            "NF4 quant_state init via module.cuda() failed for "
-                            "%s: %s", type(module).__name__, exc,
-                        )
-
-        # Phase 2: move every parameter and buffer to the target device.
-        for name, param in block.named_parameters(recurse=True):
+        for _name, param in block.named_parameters(recurse=True):
             if param.data.device == device:
                 continue
             if Params4bit is not None and isinstance(param, Params4bit):
@@ -890,11 +853,17 @@ class BlockSwapManager:
         start_time = time.time()
         
         if self._has_nf4_layers:
-            # bitsandbytes Params4bit.to(device, non_blocking=True) raises
-            # cudaErrorInvalidValue on CUDA->CPU transfers, so NF4 always
-            # uses synchronous per-parameter movement.  This also moves
-            # the per-parameter quant_state tensors correctly.
-            self._move_nf4_block_params(block, device)
+            if device.type == "cuda":
+                # CPU→GPU: use block.to() which goes through Module._apply
+                # → Params4bit.to() → _quantize() for unquantized weights.
+                # This properly initializes quant_state for pre-quantized
+                # models where transformers >=5.0 leaves it unset.
+                block.to(device, non_blocking=False)
+            else:
+                # GPU→CPU: manual per-param move.  block.to() with
+                # non_blocking=True crashes for NF4 (cudaErrorInvalidValue)
+                # and even sync moves can fail for Params4bit.
+                self._move_nf4_block_params(block, device)
         else:
             block.to(device, non_blocking=non_blocking)
             self._fix_int8_state_devices(block, device)
