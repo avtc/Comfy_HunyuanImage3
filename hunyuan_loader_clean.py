@@ -772,7 +772,8 @@ class CleanModelLoader:
                 low_cpu_mem_usage=True,
             )
 
-        # Move non-block components to GPU
+        # Move non-block components to GPU (embeddings, projections, etc.)
+        # This properly handles Params4bit via Module.to() → Params4bit.to().
         target = torch.device(device)
         moved_gb = _move_non_block_components_to_gpu(model, target)
         logger.info(f"Moved {moved_gb:.2f}GB of non-block components to {device}")
@@ -794,15 +795,6 @@ class CleanModelLoader:
                         pass
         except (ImportError, Exception):
             pass
-
-        # Apply transformers 5.x compat fixes for NF4 (issues #24, #27, #34).
-        # Skip block layers — they stay on CPU for BlockSwapManager and must
-        # not be moved to GPU by module.cuda() during compat init.
-        try:
-            from .hunyuan_shared import apply_nf4_transformers_compat
-        except ImportError:
-            from hunyuan_shared import apply_nf4_transformers_compat
-        apply_nf4_transformers_compat(model, skip_block_layers=True)
 
         # Load tokenizer
         if hasattr(model, 'load_tokenizer'):

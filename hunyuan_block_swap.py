@@ -779,60 +779,31 @@ class BlockSwapManager:
     def _move_nf4_block_params(self, block, device: torch.device) -> None:
         """Move a block's NF4 params/buffers one at a time.
 
-        Two paths depending on whether the Params4bit has been quantized yet:
-
-        * **First GPU move** (``bnb_quantized=False``): pre-quantized NF4
-          models load float weights to CPU.  Calling ``param.to(device)``
-          triggers ``Params4bit._quantize()`` which quantizes the float data,
-          creates ``quant_state``, and sets ``bnb_quantized=True`` — all
-          in-place on the same object (``_quantize`` returns ``self``).
-
-        * **Subsequent moves** (``bnb_quantized=True``): manually move
-          ``param.data`` and ``quant_state`` tensors.  This avoids
-          ``Params4bit.to()`` which creates a **new** Params4bit object and
-          loses the ``module`` back-reference.
+        Iterates all parameters, moving Params4bit data + quant_state
+        and regular parameters individually.  Avoids ``block.to()`` which
+        calls ``Params4bit.to()`` that creates a **new** Params4bit object,
+        losing the module back-reference and quant_state linkage that
+        ``fix_4bit_weight_quant_state_from_module`` relies on.
         """
         try:
-            from bitsandbytes.nn import Params4bit  # noqa: F401
+            from bitsandbytes.nn import Params4bit
         except ImportError:
-            Params4bit = None  # type: ignore[assignment]
+            Params4bit = None
 
-        _diag_block = not hasattr(self, '_nf4_diag_done')
-        for _name, param in block.named_parameters(recurse=True):
-            if param.data.device == device:
-                continue
+        for param in block.parameters():
             if Params4bit is not None and isinstance(param, Params4bit):
-                bnb_q = getattr(param, "bnb_quantized", False)
-                qs = getattr(param, "quant_state", None)
-                if _diag_block:
-                    logger.info(
-                        "[NF4 diag] %s: dtype=%s shape=%s bnb_quantized=%s "
-                        "quant_state=%s module=%s",
-                        _name, param.data.dtype, list(param.data.shape),
-                        bnb_q,
-                        "None" if qs is None else type(qs).__name__,
-                        type(getattr(param, "module", None)).__name__
-                        if getattr(param, "module", None) is not None else "None",
-                    )
-                if not bnb_q:
-                    # First move to GPU: trigger _quantize() which creates
-                    # quant_state in-place and returns self.
-                    param.to(device)
-                else:
-                    # Already quantized: manual per-tensor move.
-                    param.data = param.data.to(device, non_blocking=False)
-                    if qs is not None:
-                        self._move_quant_state(qs, device)
-                    elif _diag_block:
-                        logger.warning("[NF4 diag] %s: quant_state is None!", _name)
+                if param.data.device != device:
+                    param.data = param.data.to(device)
+                qs = getattr(param, 'quant_state', None)
+                if qs is not None:
+                    self._move_quant_state(qs, device)
             else:
-                param.data = param.data.to(device, non_blocking=False)
-        if _diag_block:
-            self._nf4_diag_done = True
+                if param.device != device:
+                    param.data = param.data.to(device)
 
-        for _name, buf in block.named_buffers(recurse=True):
-            if buf.data.device != device:
-                buf.data = buf.data.to(device, non_blocking=False)
+        for buf in block.buffers():
+            if buf.device != device:
+                buf.data = buf.data.to(device)
 
     @staticmethod
     def _move_quant_state(quant_state, device: torch.device) -> None:
