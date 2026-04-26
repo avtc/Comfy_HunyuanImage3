@@ -776,40 +776,15 @@ class BlockSwapManager:
     # Block movement
     # ------------------------------------------------------------------
 
-    def _ensure_nf4_quantized(self, block: nn.Module) -> None:
-        """Ensure every Params4bit in *block* has quant_state initialized.
-
-        Pre-quantized NF4 models loaded by transformers >=5.0 can end up
-        with ``Params4bit(bnb_quantized=True, quant_state=None)`` — an
-        inconsistent state where ``Params4bit.to()`` skips ``_quantize()``
-        and never builds the missing quant_state.  Resetting the flag
-        forces ``_quantize()`` to run on the next ``.to(cuda)`` call.
-        """
-        try:
-            from bitsandbytes.nn import Params4bit
-        except ImportError:
-            return
-        fixed = 0
-        for param in block.parameters():
-            if not isinstance(param, Params4bit):
-                continue
-            if getattr(param, "quant_state", None) is not None:
-                continue
-            if getattr(param, "bnb_quantized", False):
-                param.bnb_quantized = False  # type: ignore[attr-defined]
-                fixed += 1
-        if fixed:
-            logger.info("Reset bnb_quantized=False on %d Params4bit weights "
-                        "in block (quant_state was None)", fixed)
-
     def _move_nf4_block_params(self, block, device: torch.device) -> None:
-        """Move a block's NF4 params/buffers GPU→CPU one at a time.
+        """Move a block's NF4 params/buffers one at a time.
 
-        Used for GPU→CPU offload only (CPU→GPU uses ``block.to()`` which
-        properly handles ``Params4bit._quantize()``).  ``Params4bit.to()``
-        with ``non_blocking=True`` raises ``cudaErrorInvalidValue`` on
-        CUDA→CPU, so we move each tensor synchronously and walk the
-        ``quant_state`` to keep its sub-tensors coherent.
+        Used for BOTH CPU→GPU and GPU→CPU.  Never calls ``block.to()``
+        because ``Params4bit.to()`` creates a **new** Params4bit object,
+        discarding the ``module`` back-reference and losing the
+        ``quant_state`` linkage that ``fix_4bit_weight_quant_state_from_module``
+        relies on.  Moving ``param.data`` and ``quant_state`` tensors in-place
+        preserves the original Params4bit objects and their state.
         """
         try:
             from bitsandbytes.nn import Params4bit  # noqa: F401
@@ -879,20 +854,12 @@ class BlockSwapManager:
         start_time = time.time()
         
         if self._has_nf4_layers:
-            if device.type == "cuda":
-                # CPU→GPU: force quant_state initialization then move.
-                #
-                # Pre-quantized NF4 models loaded by transformers >=5.0 may
-                # have Params4bit with bnb_quantized=True but quant_state=None.
-                # Params4bit.to() skips _quantize() when bnb_quantized=True,
-                # so we must reset the flag to force proper initialization.
-                self._ensure_nf4_quantized(block)
-                block.to(device, non_blocking=False)
-            else:
-                # GPU→CPU: manual per-param move.  block.to() with
-                # non_blocking=True crashes for NF4 (cudaErrorInvalidValue)
-                # and even sync moves can fail for Params4bit.
-                self._move_nf4_block_params(block, device)
+            # NF4: always use manual per-param move for BOTH directions.
+            # block.to() calls Params4bit.to() which creates NEW Params4bit
+            # objects, losing the module back-reference and quant_state
+            # linkage.  Moving param.data + quant_state tensors in-place
+            # preserves the original Params4bit objects intact.
+            self._move_nf4_block_params(block, device)
         else:
             block.to(device, non_blocking=non_blocking)
             self._fix_int8_state_devices(block, device)
