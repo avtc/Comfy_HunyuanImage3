@@ -1699,7 +1699,10 @@ class HunyuanInstructLoader:
                 from .hunyuan_shared import apply_nf4_transformers_compat
             except ImportError:
                 from hunyuan_shared import apply_nf4_transformers_compat
-            apply_nf4_transformers_compat(model)
+            apply_nf4_transformers_compat(
+                model,
+                skip_block_layers=(blocks_to_swap > 0 and BLOCK_SWAP_AVAILABLE),
+            )
 
             model_info["is_moveable"] = True
             

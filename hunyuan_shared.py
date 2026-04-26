@@ -875,7 +875,7 @@ def patch_static_cache_lazy_init() -> None:
     )
 
 
-def apply_nf4_transformers_compat(model) -> None:
+def apply_nf4_transformers_compat(model, skip_block_layers: bool = False) -> None:
     """Apply runtime compatibility shims for NF4 models on transformers >=5.0.
 
     Two known issues require workarounds (issues #24, #27, #34):
@@ -897,6 +897,14 @@ def apply_nf4_transformers_compat(model) -> None:
 
     Both shims are no-ops on transformers <5.0 or when the issue is not
     present.  Safe to call multiple times.
+
+    Args:
+        model: The model to patch.
+        skip_block_layers: When True, skip ``Linear4bit`` modules that live
+            inside ``model.model.layers`` (the transformer blocks).  Needed
+            for NF4 block-swap loading where blocks must stay on CPU —
+            calling ``module.cuda()`` on them would move them to GPU and
+            corrupt the quant_state during subsequent CPU↔GPU round-trips.
     """
     if not _TRANSFORMERS_GTE_5:
         return
@@ -909,9 +917,19 @@ def apply_nf4_transformers_compat(model) -> None:
         Params4bit = None  # type: ignore[assignment]
 
     if Linear4bit is not None and Params4bit is not None and torch.cuda.is_available():
+        # Build set of module ids to skip (transformer blocks) if requested.
+        _skip_ids = set()
+        if skip_block_layers:
+            _layers = getattr(getattr(model, "model", None), "layers", None)
+            if _layers is not None:
+                for _blk in _layers:
+                    _skip_ids.update(id(m) for m in _blk.modules())
+
         fixed = 0
         for module in model.modules():
             if not isinstance(module, Linear4bit):
+                continue
+            if id(module) in _skip_ids:
                 continue
             weight = getattr(module, "weight", None)
             if not isinstance(weight, Params4bit):

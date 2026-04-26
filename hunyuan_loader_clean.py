@@ -795,12 +795,14 @@ class CleanModelLoader:
         except (ImportError, Exception):
             pass
 
-        # Apply transformers 5.x compat fixes for NF4 (issues #24, #27, #34)
+        # Apply transformers 5.x compat fixes for NF4 (issues #24, #27, #34).
+        # Skip block layers — they stay on CPU for BlockSwapManager and must
+        # not be moved to GPU by module.cuda() during compat init.
         try:
             from .hunyuan_shared import apply_nf4_transformers_compat
         except ImportError:
             from hunyuan_shared import apply_nf4_transformers_compat
-        apply_nf4_transformers_compat(model)
+        apply_nf4_transformers_compat(model, skip_block_layers=True)
 
         # Load tokenizer
         if hasattr(model, 'load_tokenizer'):

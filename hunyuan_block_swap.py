@@ -785,46 +785,73 @@ class BlockSwapManager:
         on CUDA->CPU (non-blocking is unsupported for paged-host transfers of
         the packed uint8 storage), so we move each tensor synchronously and
         also walk the ``quant_state`` to keep its tensors coherent.
+
+        For ``Params4bit`` weights whose ``quant_state`` is None (pre-quantized
+        models loaded by transformers >=5.0 without proper init), we fall back
+        to ``Params4bit.to(device)`` which triggers ``_quantize`` and builds
+        the missing quant_state from the on-disk packed data.
         """
         try:
             from bitsandbytes.nn import Params4bit  # noqa: F401
         except ImportError:
             Params4bit = None  # type: ignore[assignment]
 
-        for _name, param in block.named_parameters(recurse=True):
+        for name, param in block.named_parameters(recurse=True):
             if param.data.device == device:
                 continue
-            new_data = param.data.to(device, non_blocking=False)
-            param.data = new_data
-            quant_state = getattr(param, "quant_state", None)
-            if quant_state is None:
-                continue
-            # quant_state may have a .to() method (newer bnb) — use it when
-            # available; otherwise walk its tensor attributes individually.
-            if hasattr(quant_state, "to") and callable(quant_state.to):
-                try:
-                    quant_state.to(device)
+            if Params4bit is not None and isinstance(param, Params4bit):
+                quant_state = getattr(param, "quant_state", None)
+                if quant_state is None and device.type == "cuda":
+                    # quant_state not initialized — let Params4bit.to() handle
+                    # _quantize() which builds quant_state from the packed data.
+                    new_param = param.to(device, non_blocking=False)
+                    # Params4bit.to() returns a new object; replace in module.
+                    self._replace_param_in_block(block, name, new_param)
                     continue
-                except Exception:
-                    pass
-            for attr in (
-                "absmax", "code", "offset", "state2",
-                "quant_map", "nested_absmax", "nested_quant_map",
-            ):
-                t = getattr(quant_state, attr, None)
-                if isinstance(t, torch.Tensor) and t.device != device:
-                    setattr(quant_state, attr, t.to(device, non_blocking=False))
-            # Nested quant_state (double quantization)
-            nested = getattr(quant_state, "state2", None)
-            if nested is not None and not isinstance(nested, torch.Tensor):
-                for attr in ("absmax", "code", "quant_map"):
-                    t = getattr(nested, attr, None)
-                    if isinstance(t, torch.Tensor) and t.device != device:
-                        setattr(nested, attr, t.to(device, non_blocking=False))
+                # quant_state exists — move data + quant_state tensors manually.
+                param.data = param.data.to(device, non_blocking=False)
+                if quant_state is not None:
+                    self._move_quant_state(quant_state, device)
+            else:
+                param.data = param.data.to(device, non_blocking=False)
 
         for _name, buf in block.named_buffers(recurse=True):
             if buf.data.device != device:
                 buf.data = buf.data.to(device, non_blocking=False)
+
+    @staticmethod
+    def _replace_param_in_block(block: nn.Module, param_name: str,
+                                 new_param: nn.Parameter) -> None:
+        """Replace a named parameter inside a block module hierarchy."""
+        parts = param_name.split(".")
+        obj = block
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        # _parameters is the canonical dict used by named_parameters()
+        obj._parameters[parts[-1]] = new_param
+
+    @staticmethod
+    def _move_quant_state(quant_state, device: torch.device) -> None:
+        """Move all tensors inside a bitsandbytes QuantState to *device*."""
+        if hasattr(quant_state, "to") and callable(quant_state.to):
+            try:
+                quant_state.to(device)
+                return
+            except Exception:
+                pass
+        for attr in (
+            "absmax", "code", "offset", "state2",
+            "quant_map", "nested_absmax", "nested_quant_map",
+        ):
+            t = getattr(quant_state, attr, None)
+            if isinstance(t, torch.Tensor) and t.device != device:
+                setattr(quant_state, attr, t.to(device, non_blocking=False))
+        nested = getattr(quant_state, "state2", None)
+        if nested is not None and not isinstance(nested, torch.Tensor):
+            for attr in ("absmax", "code", "quant_map"):
+                t = getattr(nested, attr, None)
+                if isinstance(t, torch.Tensor) and t.device != device:
+                    setattr(nested, attr, t.to(device, non_blocking=False))
 
     def _move_block_to_device_raw(
         self,
