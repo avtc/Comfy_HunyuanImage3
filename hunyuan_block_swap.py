@@ -797,20 +797,33 @@ class BlockSwapManager:
         except ImportError:
             Params4bit = None  # type: ignore[assignment]
 
+        _diag_logged = False
         for _name, param in block.named_parameters(recurse=True):
             if param.data.device == device:
                 continue
             if Params4bit is not None and isinstance(param, Params4bit):
-                if not getattr(param, "bnb_quantized", False):
+                bnb_q = getattr(param, "bnb_quantized", False)
+                qs = getattr(param, "quant_state", None)
+                if not _diag_logged:
+                    _diag_logged = True
+                    logger.info(
+                        "[NF4 diag] %s: dtype=%s shape=%s bnb_quantized=%s "
+                        "quant_state=%s module=%s",
+                        _name, param.data.dtype, list(param.data.shape),
+                        bnb_q,
+                        "None" if qs is None else type(qs).__name__,
+                        type(getattr(param, "module", None)).__name__
+                        if getattr(param, "module", None) is not None else "None",
+                    )
+                if not bnb_q:
                     # First move to GPU: trigger _quantize() which creates
                     # quant_state in-place and returns self.
                     param.to(device)
                 else:
                     # Already quantized: manual per-tensor move.
                     param.data = param.data.to(device, non_blocking=False)
-                    quant_state = getattr(param, "quant_state", None)
-                    if quant_state is not None:
-                        self._move_quant_state(quant_state, device)
+                    if qs is not None:
+                        self._move_quant_state(qs, device)
             else:
                 param.data = param.data.to(device, non_blocking=False)
 
