@@ -786,30 +786,53 @@ class BlockSwapManager:
         the packed uint8 storage), so we move each tensor synchronously and
         also walk the ``quant_state`` to keep its tensors coherent.
 
-        For ``Params4bit`` weights whose ``quant_state`` is None (pre-quantized
-        models loaded by transformers >=5.0 without proper init), we fall back
-        to ``Params4bit.to(device)`` which triggers ``_quantize`` and builds
-        the missing quant_state from the on-disk packed data.
+        Pre-quantized NF4 models loaded by transformers >=5.0 may have
+        ``Params4bit.quant_state is None`` even though ``bnb_quantized=True``.
+        Before moving parameters, we ensure every ``Linear4bit`` in the block
+        has a properly initialized ``weight.quant_state``.
         """
         try:
-            from bitsandbytes.nn import Params4bit  # noqa: F401
+            from bitsandbytes.nn import Linear4bit, Params4bit  # noqa: F401
         except ImportError:
+            Linear4bit = None  # type: ignore[assignment]
             Params4bit = None  # type: ignore[assignment]
 
+        # Phase 1: ensure quant_state is initialized on every Linear4bit weight.
+        # This MUST happen before the parameter loop because Params4bit.to()
+        # skips _quantize() when bnb_quantized=True, leaving quant_state=None.
+        if Linear4bit is not None and device.type == "cuda":
+            for module in block.modules():
+                if not isinstance(module, Linear4bit):
+                    continue
+                weight = getattr(module, "weight", None)
+                if not isinstance(weight, Params4bit):
+                    continue
+                if getattr(weight, "quant_state", None) is not None:
+                    continue
+                # quant_state missing on weight — recover it.
+                module_qs = getattr(module, "quant_state", None)
+                if module_qs is not None:
+                    # Module has the quant_state backup — copy to weight.
+                    weight.quant_state = module_qs
+                else:
+                    # Neither weight nor module has quant_state.
+                    # module.cuda() triggers Params4bit._quantize() which
+                    # builds quant_state from the raw weight data.
+                    try:
+                        module.cuda(device)
+                    except Exception as exc:
+                        logger.debug(
+                            "NF4 quant_state init via module.cuda() failed for "
+                            "%s: %s", type(module).__name__, exc,
+                        )
+
+        # Phase 2: move every parameter and buffer to the target device.
         for name, param in block.named_parameters(recurse=True):
             if param.data.device == device:
                 continue
             if Params4bit is not None and isinstance(param, Params4bit):
-                quant_state = getattr(param, "quant_state", None)
-                if quant_state is None and device.type == "cuda":
-                    # quant_state not initialized — let Params4bit.to() handle
-                    # _quantize() which builds quant_state from the packed data.
-                    new_param = param.to(device, non_blocking=False)
-                    # Params4bit.to() returns a new object; replace in module.
-                    self._replace_param_in_block(block, name, new_param)
-                    continue
-                # quant_state exists — move data + quant_state tensors manually.
                 param.data = param.data.to(device, non_blocking=False)
+                quant_state = getattr(param, "quant_state", None)
                 if quant_state is not None:
                     self._move_quant_state(quant_state, device)
             else:
@@ -818,17 +841,6 @@ class BlockSwapManager:
         for _name, buf in block.named_buffers(recurse=True):
             if buf.data.device != device:
                 buf.data = buf.data.to(device, non_blocking=False)
-
-    @staticmethod
-    def _replace_param_in_block(block: nn.Module, param_name: str,
-                                 new_param: nn.Parameter) -> None:
-        """Replace a named parameter inside a block module hierarchy."""
-        parts = param_name.split(".")
-        obj = block
-        for part in parts[:-1]:
-            obj = getattr(obj, part)
-        # _parameters is the canonical dict used by named_parameters()
-        obj._parameters[parts[-1]] = new_param
 
     @staticmethod
     def _move_quant_state(quant_state, device: torch.device) -> None:
