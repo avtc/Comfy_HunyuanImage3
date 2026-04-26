@@ -779,12 +779,18 @@ class BlockSwapManager:
     def _move_nf4_block_params(self, block, device: torch.device) -> None:
         """Move a block's NF4 params/buffers one at a time.
 
-        Used for BOTH CPU→GPU and GPU→CPU.  Never calls ``block.to()``
-        because ``Params4bit.to()`` creates a **new** Params4bit object,
-        discarding the ``module`` back-reference and losing the
-        ``quant_state`` linkage that ``fix_4bit_weight_quant_state_from_module``
-        relies on.  Moving ``param.data`` and ``quant_state`` tensors in-place
-        preserves the original Params4bit objects and their state.
+        Two paths depending on whether the Params4bit has been quantized yet:
+
+        * **First GPU move** (``bnb_quantized=False``): pre-quantized NF4
+          models load float weights to CPU.  Calling ``param.to(device)``
+          triggers ``Params4bit._quantize()`` which quantizes the float data,
+          creates ``quant_state``, and sets ``bnb_quantized=True`` — all
+          in-place on the same object (``_quantize`` returns ``self``).
+
+        * **Subsequent moves** (``bnb_quantized=True``): manually move
+          ``param.data`` and ``quant_state`` tensors.  This avoids
+          ``Params4bit.to()`` which creates a **new** Params4bit object and
+          loses the ``module`` back-reference.
         """
         try:
             from bitsandbytes.nn import Params4bit  # noqa: F401
@@ -795,10 +801,16 @@ class BlockSwapManager:
             if param.data.device == device:
                 continue
             if Params4bit is not None and isinstance(param, Params4bit):
-                param.data = param.data.to(device, non_blocking=False)
-                quant_state = getattr(param, "quant_state", None)
-                if quant_state is not None:
-                    self._move_quant_state(quant_state, device)
+                if not getattr(param, "bnb_quantized", False):
+                    # First move to GPU: trigger _quantize() which creates
+                    # quant_state in-place and returns self.
+                    param.to(device)
+                else:
+                    # Already quantized: manual per-tensor move.
+                    param.data = param.data.to(device, non_blocking=False)
+                    quant_state = getattr(param, "quant_state", None)
+                    if quant_state is not None:
+                        self._move_quant_state(quant_state, device)
             else:
                 param.data = param.data.to(device, non_blocking=False)
 
