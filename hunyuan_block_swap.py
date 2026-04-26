@@ -797,15 +797,14 @@ class BlockSwapManager:
         except ImportError:
             Params4bit = None  # type: ignore[assignment]
 
-        _diag_logged = False
+        _diag_block = not hasattr(self, '_nf4_diag_done')
         for _name, param in block.named_parameters(recurse=True):
             if param.data.device == device:
                 continue
             if Params4bit is not None and isinstance(param, Params4bit):
                 bnb_q = getattr(param, "bnb_quantized", False)
                 qs = getattr(param, "quant_state", None)
-                if not _diag_logged:
-                    _diag_logged = True
+                if _diag_block:
                     logger.info(
                         "[NF4 diag] %s: dtype=%s shape=%s bnb_quantized=%s "
                         "quant_state=%s module=%s",
@@ -824,8 +823,12 @@ class BlockSwapManager:
                     param.data = param.data.to(device, non_blocking=False)
                     if qs is not None:
                         self._move_quant_state(qs, device)
+                    elif _diag_block:
+                        logger.warning("[NF4 diag] %s: quant_state is None!", _name)
             else:
                 param.data = param.data.to(device, non_blocking=False)
+        if _diag_block:
+            self._nf4_diag_done = True
 
         for _name, buf in block.named_buffers(recurse=True):
             if buf.data.device != device:
