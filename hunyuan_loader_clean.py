@@ -9,7 +9,9 @@ Copyright (c) 2025 Eric Hiss. All rights reserved.
 """
 
 import gc
+import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
@@ -36,6 +38,101 @@ class LoadResult:
         moveable = "moveable" if self.is_moveable else "fixed"
         device_map_str = " (device_map)" if self.uses_device_map else ""
         return f"LoadResult({self.quant_type}, {self.device}, {moveable}{device_map_str})"
+
+
+# ---------------------------------------------------------------------------
+# Helper: fix Linear4bit modules that should NOT be quantized
+# ---------------------------------------------------------------------------
+
+def _fix_misquantized_linear4bit(model: Any, model_path: str) -> int:
+    """Replace *Linear4bit* modules whose weight is **not** a ``Params4bit``.
+
+    When a pre-quantized NF4 model is loaded with ``device_map="cpu"``,
+    transformers may create ``Linear4bit`` wrappers for *all* linear layers,
+    including those listed in ``llm_int8_skip_modules`` (e.g. ``shared_mlp``,
+    ``gate.wg``, attention projections).  The bf16 weights are then
+    incorrectly quantised to uint8 without a proper ``quant_state``, causing
+    ``AssertionError`` in ``Linear4bit.forward()``.
+
+    This function detects such modules, loads the original bf16 weights from
+    the safetensors shards, and replaces them with standard ``nn.Linear``.
+    """
+    try:
+        from bitsandbytes.nn import Linear4bit, Params4bit
+    except ImportError:
+        return 0
+
+    # Collect broken modules: Linear4bit whose weight is NOT Params4bit
+    broken: Dict[str, Any] = {}
+    for name, module in model.named_modules():
+        if isinstance(module, Linear4bit) and not isinstance(module.weight, Params4bit):
+            broken[name] = module
+
+    if not broken:
+        return 0
+
+    logger.info("Found %d mis-quantized Linear4bit module(s) to fix", len(broken))
+
+    # Resolve shard → weight mapping from safetensors index
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    single_shard = os.path.join(model_path, "model.safetensors")
+
+    weight_map: Dict[str, str] = {}
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as fh:
+            weight_map = json.load(fh).get("weight_map", {})
+    elif os.path.exists(single_shard):
+        # Single-shard model: all weights in one file
+        from safetensors import safe_open as _sf
+        with _sf(single_shard, framework="pt") as fh:
+            weight_map = {k: "model.safetensors" for k in fh.keys()}
+    else:
+        logger.warning("No safetensors index or single shard found — cannot fix modules")
+        return 0
+
+    # Group broken modules by shard for batched loading
+    shard_groups: Dict[str, List[Tuple[str, str, Any]]] = {}
+    for mod_name, mod in broken.items():
+        wkey = mod_name + ".weight"
+        shard = weight_map.get(wkey)
+        if shard is None:
+            logger.warning("Weight %s not in safetensors index — skipping", wkey)
+            continue
+        shard_groups.setdefault(shard, []).append((wkey, mod_name, mod))
+
+    # Load each shard once and replace broken modules
+    from safetensors import safe_open
+
+    fixed = 0
+    for shard_file, entries in shard_groups.items():
+        shard_path = os.path.join(model_path, shard_file)
+        with safe_open(shard_path, framework="pt") as fh:
+            for wkey, mod_name, old_mod in entries:
+                bf16_weight = fh.get_tensor(wkey)
+                out_feat, in_feat = bf16_weight.shape
+                has_bias = old_mod.bias is not None
+                new_mod = nn.Linear(in_feat, out_feat, bias=has_bias)
+                new_mod.weight = nn.Parameter(bf16_weight)
+                if has_bias and old_mod.bias is not None:
+                    new_mod.bias = nn.Parameter(old_mod.bias.data.clone())
+                new_mod = new_mod.to(device=next(old_mod.parameters()).device)
+                _replace_nested_module(model, mod_name, new_mod)
+                fixed += 1
+
+    logger.info("Fixed %d / %d mis-quantized module(s)", fixed, len(broken))
+    return fixed
+
+
+def _replace_nested_module(root: nn.Module, dotted_name: str, new_module: nn.Module) -> None:
+    """Set *new_module* at the dotted attribute path inside *root*."""
+    parts = dotted_name.split(".")
+    parent = root
+    for part in parts[:-1]:
+        if part.isdigit():
+            parent = parent[int(part)]
+        else:
+            parent = getattr(parent, part)
+    setattr(parent, parts[-1], new_module)
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +868,13 @@ class CleanModelLoader:
                 torch_dtype=dtype,
                 low_cpu_mem_usage=True,
             )
+
+        # Fix Linear4bit modules that should NOT be quantized.
+        # device_map="cpu" may create Linear4bit for ALL linear layers,
+        # including those in llm_int8_skip_modules (shared_mlp, gate.wg,
+        # attn projections).  Their bf16 weights get incorrectly quantized
+        # to uint8 without quant_state, causing AssertionError in forward().
+        _fix_misquantized_linear4bit(model, model_path)
 
         # Move non-block components to GPU (embeddings, projections, etc.)
         # This properly handles Params4bit via Module.to() → Params4bit.to().

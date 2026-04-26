@@ -779,54 +779,32 @@ class BlockSwapManager:
     def _move_nf4_block_params(self, block, device: torch.device) -> None:
         """Move a block's NF4 params/buffers one at a time.
 
-        Two paths for Params4bit depending on quantization state:
+        * ``Params4bit`` — already packed uint8 with quant_state.  Move
+          ``param.data`` and ``quant_state`` tensors manually to avoid
+          ``Params4bit.to()`` creating a new object that loses the module
+          back-reference.
 
-        * ``bnb_quantized=False`` — float data not yet quantized.  Calling
-          ``param.to(device)`` triggers ``Params4bit._quantize()`` which
-          quantizes in-place, creates ``quant_state``, and sets
-          ``bnb_quantized=True``.
-
-        * ``bnb_quantized=True`` — already packed uint8.  Move ``param.data``
-          and ``quant_state`` tensors manually to avoid ``Params4bit.to()``
-          creating a new object that loses the module back-reference.
+        * Regular ``nn.Parameter`` (bf16) — from modules that were NOT
+          quantized (shared_mlp, gate.wg, attn projections).  Moved with
+          standard ``.to()``.
         """
         try:
             from bitsandbytes.nn import Params4bit
         except ImportError:
             Params4bit = None
 
-        _diag = not hasattr(self, '_nf4_full_diag_done')
-        for name, param in block.named_parameters(recurse=True):
+        for _name, param in block.named_parameters(recurse=True):
             if Params4bit is not None and isinstance(param, Params4bit):
-                bnb_q = getattr(param, "bnb_quantized", False)
-                qs = getattr(param, "quant_state", None)
-                if _diag:
-                    logger.info(
-                        "[NF4] %s: Params4bit bnb_q=%s qs=%s shape=%s dtype=%s dev=%s",
-                        name, bnb_q,
-                        "None" if qs is None else type(qs).__name__,
-                        list(param.data.shape), param.data.dtype, param.data.device,
-                    )
                 if param.data.device == device:
                     continue
-                if not bnb_q:
-                    # Float data — quantize on target device (in-place).
-                    param.to(device)
-                else:
-                    # Packed uint8 — manual per-tensor move.
-                    param.data = param.data.to(device)
-                    if qs is not None:
-                        self._move_quant_state(qs, device)
+                # Packed uint8 — manual per-tensor move.
+                param.data = param.data.to(device)
+                qs = getattr(param, "quant_state", None)
+                if qs is not None:
+                    self._move_quant_state(qs, device)
             else:
-                if _diag:
-                    logger.info(
-                        "[NF4] %s: regular param shape=%s dtype=%s dev=%s",
-                        name, list(param.data.shape), param.data.dtype, param.data.device,
-                    )
                 if param.data.device != device:
                     param.data = param.data.to(device)
-        if _diag:
-            self._nf4_full_diag_done = True
 
         for buf in block.buffers():
             if buf.device != device:

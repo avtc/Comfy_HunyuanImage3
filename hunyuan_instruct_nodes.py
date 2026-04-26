@@ -1699,6 +1699,17 @@ class HunyuanInstructLoader:
                 from .hunyuan_shared import apply_nf4_transformers_compat
             except ImportError:
                 from hunyuan_shared import apply_nf4_transformers_compat
+
+            # Fix Linear4bit modules that should NOT be quantized.
+            # device_map="cpu" or device_map={"":...} may create Linear4bit
+            # for ALL linear layers including those in llm_int8_skip_modules
+            # (shared_mlp, gate.wg, attn projections).  Their bf16 weights
+            # get incorrectly quantized to uint8 without quant_state.
+            try:
+                from .hunyuan_loader_clean import _fix_misquantized_linear4bit
+            except ImportError:
+                from hunyuan_loader_clean import _fix_misquantized_linear4bit
+            _fix_misquantized_linear4bit(model, model_path)
             apply_nf4_transformers_compat(
                 model,
                 skip_block_layers=(blocks_to_swap > 0 and BLOCK_SWAP_AVAILABLE),
